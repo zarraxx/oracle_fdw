@@ -1,3 +1,47 @@
+# oracle_rs_fdw Fork Notes
+
+这个仓库当前是上游 `oracle_fdw` 的一个 fork，目标是在保留现有 FDW 能力的基础上，逐步完成 Oracle 访问后端的替换与扩展解耦。
+
+## 当前目标
+
+1. 将 `oracle_fdw` 的 Oracle 后端从 OCI 迁移到 `oracle-rs`。
+2. 将扩展名从 `oracle_fdw` 重命名为 `oracle_rs_fdw`，以便和原始扩展在同一个 PostgreSQL 实例中共存。
+3. 直接新增 [oracle_utils.h](/home/zarra/Documents/projects/oracle_fdw/oracle_utils.h)，将当前 [oracle_fdw.h](/home/zarra/Documents/projects/oracle_fdw/oracle_fdw.h) 中仅供 [oracle_utils.c](/home/zarra/Documents/projects/oracle_fdw/oracle_utils.c) 使用的定义逐步拆分出来。
+
+## `oracle_utils.h` 拆分方向
+
+这个头文件的目标是把 `oracle_fdw.h` 中原来 `#ifdef OCI_ORACLE` 代码块里的实现细节逐步拆出来，也就是 `connEntry`、`srvEntry`、`envEntry` 和 `oracleSession` 这组与连接缓存、语句句柄相关的定义，整理到一个更适合后端替换的接口层里。
+
+拆分后的头文件需要把 OCI 专有的句柄指针统一改成 `void *`，这样 `oracle_utils.c` 依赖的会是“后端无关的结构外形”，而不是直接依赖 OCI 类型名。这样做的目的是为不同后端实现保留兼容层，比如 OCI 实现、`oracle-rs` thin 实现，或者后续其它桥接实现。
+
+例如，`oracleSession` 的目标形态可以调整为：
+
+```c
+struct oracleSession
+{
+    void       *thin_conn;
+    void       *thin_stmt;
+    void       *thin_result;
+    void       *thin_runtime;
+    void       *user_data;
+
+    int         have_nchar;
+    int         server_version[5];
+
+    unsigned int last_batch;
+    unsigned int fetched_rows;
+    unsigned int current_row;
+};
+```
+
+同样的思路也适用于 `connEntry`、`srvEntry` 和 `envEntry` 中当前的 OCI 句柄字段，例如 `OCISvcCtx *`、`OCISession *`、`OCIType *`、`OCIServer *`、`OCIEnv *`、`OCIError *` 与 `OCIStmt *` 等，都应在拆分后的头文件中转换为 `void *` 指针字段，以兼容不同后端实现。
+
+## 当前状态说明
+
+截至 2026-07-01，这个仓库里的构建与扩展元数据仍然主要沿用上游命名，例如 [Makefile](/home/zarra/Documents/projects/oracle_fdw/Makefile) 和 [oracle_fdw.control](/home/zarra/Documents/projects/oracle_fdw/oracle_fdw.control) 仍使用 `oracle_fdw`。因此，上述内容目前应视为这个 fork 的改造目标和设计方向，而不是已经全部完成的实现状态。
+
+下面继续保留原始上游 README 全文，作为当前 OCI 版本行为的参考。
+
 Foreign Data Wrapper for Oracle
 ===============================
 
