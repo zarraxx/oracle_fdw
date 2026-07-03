@@ -9,6 +9,9 @@
  *-------------------------------------------------------------------------
  */
 
+#ifndef ORACLE_FDW_H
+#define ORACLE_FDW_H
+
 /* this one is safe to include and gives us Oid */
 #include "postgres_ext.h"
 
@@ -254,3 +257,5 @@ extern unsigned int oracleGetEWKBLen(oracleSession *session, ora_geometry *geom)
 extern char *oracleFillEWKB(oracleSession *session, ora_geometry *geom, unsigned int size, char *dest);
 extern void oracleGeometryFree(oracleSession *session, ora_geometry *geom);
 extern void oracleGeometryAlloc(oracleSession *session, ora_geometry *geom);
+
+#endif /* ORACLE_FDW_H */

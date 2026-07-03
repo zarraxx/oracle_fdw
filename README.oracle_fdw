@@ -1,3 +1,85 @@
+# oracle_fdw backend migration status
+
+This fork is experimenting with replacing the original OCI implementation in
+`oracle_utils.c` with a non-OCI backend.
+
+## Current Rust backend status
+
+The `oracle-rs` backend is an experimental first pass, not a production-ready
+replacement for OCI.
+
+What currently exists:
+
+- CMake can build the original OCI demo and the Rust demo.
+- `rust_backend/oracle-rs/src/ffi.rs` exports the same `oracle_utils.c` ABI used by
+  `test/oracle_utils_demo.c`.
+- PostgreSQL-side wrapper callbacks are registered through
+  `rust_backend/oracle_rust_pg_callbacks.h` /
+  `rust_backend/oracle_rust_pg_callbacks.c`.
+- The Rust demo can connect to Oracle and currently exercises these paths:
+  connect, describe, simple query, CLOB read, PL/SQL call, import-column
+  metadata, explain plan.
+
+Known limitations:
+
+- This is only a behavioral experiment for the demo path.
+- `oracle-rs` currently mishandles at least one SQL error response path. A
+  query that should return `ORA-06553` is reported as a connection-close
+  condition, and the following query fails with `connection closed
+  unexpectedly`.
+- Because of that upstream error-handling issue, the Rust backend cannot yet
+  be used as a reliable parity test against OCI.
+- Geometry, cancel/break handling, full bind support, full transaction callback
+  parity, and exact server-version reporting are incomplete.
+
+## Current JNI backend status
+
+The JNI backend is a second experimental path that uses Oracle JDBC through a
+small Java bridge under `jni_backend/java`.
+
+What currently exists:
+
+- CMake builds three demo executables when `ORACLE_FDW_BUILD_UTILS_DEMO` is ON:
+  `oracle_utils_demo_oci`, `oracle_utils_demo_rust`, and
+  `oracle_utils_demo_jni`.
+- `jni_backend/oracle_utils_jni.c` exports the same demo-facing
+  `oracle_utils.c` ABI and calls `OracleJdbcBackend` through JNI.
+- The JNI demo currently covers connect, client/server version, describe,
+  simple query, CLOB read, PL/SQL call, import-column metadata, explain plan,
+  transaction end, and connection shutdown.
+- `JDK17_HOME` must point to JDK 17 or newer. The build compiles the Java bridge
+  with `javac -source 17 -target 17`.
+- The default JDBC driver is `$INSTANT_CLIENT_HOME/ojdbc17.jar`. Runtime
+  overrides are available through `ORACLE_FDW_JDBC_JAR` or a complete
+  `ORACLE_FDW_JDBC_CLASSPATH`.
+
+Known limitations:
+
+- This is only a demo backend, not a full PostgreSQL FDW backend.
+- The JVM is loaded into the process, so a production design would need a
+  careful lifecycle, classpath, signal, thread, memory ownership, and unload
+  review.
+- The demo must load `jvm.dll` from the original JDK layout. On Windows, prefer
+  adding `%JDK17_HOME%\bin\server` and `%JDK17_HOME%\bin` to `PATH`; copying
+  `jvm.dll` beside the executable breaks JDK module discovery.
+- Full bind support, geometry, cancel/break behavior, and detailed Oracle error
+  to PostgreSQL SQLSTATE mapping are still incomplete.
+
+## go-ora feasibility note
+
+`sijms/go-ora` is a pure Go Oracle client. It is not shipped as a C ABI library.
+Using it from this C/PostgreSQL extension would require writing a small Go
+`package main` wrapper that exports C-callable functions with cgo `//export`,
+then building that wrapper with Go's `-buildmode=c-archive` or
+`-buildmode=c-shared`.
+
+That means go-ora is possible to experiment with, but not a drop-in static C
+library. It would introduce the Go runtime into the PostgreSQL backend process,
+so lifecycle, threads, signals, memory ownership, and unload behavior must be
+reviewed carefully before treating it as a serious backend candidate.
+
+---
+
 # oracle_rs_fdw Fork Notes
 
 这个仓库当前是上游 `oracle_fdw` 的一个 fork，目标是在保留现有 FDW 能力的基础上，逐步完成 Oracle 访问后端的替换与扩展解耦。
@@ -36,11 +118,7 @@ struct oracleSession
 
 同样的思路也适用于 `connEntry`、`srvEntry` 和 `envEntry` 中当前的 OCI 句柄字段，例如 `OCISvcCtx *`、`OCISession *`、`OCIType *`、`OCIServer *`、`OCIEnv *`、`OCIError *` 与 `OCIStmt *` 等，都应在拆分后的头文件中转换为 `void *` 指针字段，以兼容不同后端实现。
 
-## 当前状态说明
 
-截至 2026-07-01，这个仓库里的构建与扩展元数据仍然主要沿用上游命名，例如 [Makefile](/home/zarra/Documents/projects/oracle_fdw/Makefile) 和 [oracle_fdw.control](/home/zarra/Documents/projects/oracle_fdw/oracle_fdw.control) 仍使用 `oracle_fdw`。因此，上述内容目前应视为这个 fork 的改造目标和设计方向，而不是已经全部完成的实现状态。
-
-下面继续保留原始上游 README 全文，作为当前 OCI 版本行为的参考。
 
 Foreign Data Wrapper for Oracle
 ===============================
