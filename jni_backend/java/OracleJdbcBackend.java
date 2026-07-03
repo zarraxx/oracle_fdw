@@ -253,6 +253,10 @@ public final class OracleJdbcBackend {
     }
 
     public int prepareQueryHandle(String sql) throws SQLException {
+        return prepareQueryHandle(sql, 0);
+    }
+
+    public int prepareQueryHandle(String sql, int fetchSize) throws SQLException {
         ParsedSql parsedSql = parseBindParameters(rewriteDateTimeLiteralCasts(sql));
         String preparedSql = rewriteDateTimeSelectColumns(parsedSql.sql);
         QueryState state = new QueryState();
@@ -262,6 +266,9 @@ public final class OracleJdbcBackend {
         state.bindOracleTypes = inferBindOracleTypes(preparedSql, parsedSql.bindOrder.size());
         state.currentSql = preparedSql;
         state.preparedStatement = connection.prepareStatement(preparedSql);
+        if (fetchSize > 0) {
+            state.preparedStatement.setFetchSize(fetchSize);
+        }
 
         handle = nextStatementHandle++;
         if (nextStatementHandle <= 0) {

@@ -667,7 +667,7 @@ ensureJvm(void)
 			loadMethod(jni_env, &close_mid, "close", "()V", 0);
 			loadMethod(jni_env, &close_statement_mid, "closeStatement", "()V", 0);
 			loadMethod(jni_env, &is_statement_open_mid, "isStatementOpen", "()Z", 0);
-			loadMethod(jni_env, &prepare_query_handle_mid, "prepareQueryHandle", "(Ljava/lang/String;)I", 0);
+			loadMethod(jni_env, &prepare_query_handle_mid, "prepareQueryHandle", "(Ljava/lang/String;I)I", 0);
 			loadMethod(jni_env, &close_statement_handle_mid, "closeStatementHandle", "(I)V", 0);
 			loadMethod(jni_env, &is_statement_open_handle_mid, "isStatementOpenHandle", "(I)Z", 0);
 			loadMethod(jni_env, &describe_mid, "describe", "(Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;", 0);
@@ -1533,14 +1533,13 @@ oraclePrepareQuery(oracleSession *session, const char *query, const struct oraTa
 	JniStatementState *stmt_state = getStatementState(session);
 	jstring j_query = newJavaString(env, query);
 
-	(void)prefetch;
 	(void)lob_prefetch;
 
 	if (session->thin_stmt)
 		oracleCloseStatement(session);
 
 	session->thin_stmt = (void *)(intptr_t)(*env)->CallIntMethod(env, state->backend,
-																prepare_query_handle_mid, j_query);
+																prepare_query_handle_mid, j_query, (jint)prefetch);
 	checkJava(env, "error preparing Oracle query through JDBC backend");
 
 	freeLobs(state);
