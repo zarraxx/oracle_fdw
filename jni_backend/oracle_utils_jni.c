@@ -1,3 +1,8 @@
+#ifndef USE_JNI_BACKEND
+#include "postgres.h"
+#include "utils/elog.h"
+#endif
+
 #include <jni.h>
 
 #include <stdint.h>
@@ -23,6 +28,14 @@
 
 #define JNI_FIELD_SEP '\x1f'
 
+#if defined(_MSC_VER)
+#define ORACLE_FDW_THREAD_LOCAL __declspec(thread)
+#elif defined(__GNUC__) || defined(__clang__)
+#define ORACLE_FDW_THREAD_LOCAL __thread
+#else
+#define ORACLE_FDW_THREAD_LOCAL _Thread_local
+#endif
+
 typedef struct JniLobContent
 {
 	char *data;
@@ -36,10 +49,12 @@ typedef struct JniSessionState
 	const struct oraTable *current_table;
 	unsigned int next_row;
 	int import_open;
+	int callback_registered;
 	JniLobContent *lobs;
 } JniSessionState;
 
 static JavaVM *jvm = NULL;
+static ORACLE_FDW_THREAD_LOCAL JNIEnv *jni_env = NULL;
 static jclass backend_class = NULL;
 static jmethodID ctor_mid = NULL;
 static jmethodID client_version_mid = NULL;
@@ -50,6 +65,7 @@ static jmethodID is_statement_open_mid = NULL;
 static jmethodID describe_mid = NULL;
 static jmethodID prepare_query_mid = NULL;
 static jmethodID execute_query_mid = NULL;
+static jmethodID execute_query_with_params_mid = NULL;
 static jmethodID fetch_next_mid = NULL;
 static jmethodID get_value_mid = NULL;
 static jmethodID execute_call_mid = NULL;
@@ -59,7 +75,7 @@ static jmethodID explain_mid = NULL;
 static jmethodID load_import_columns_mid = NULL;
 static jmethodID get_import_column_next_mid = NULL;
 
-static oracleSession **sessions = NULL;
+static JniSessionState **sessions = NULL;
 static size_t session_count = 0;
 static size_t session_capacity = 0;
 
@@ -68,6 +84,32 @@ setOutputInt(int *out, int value)
 {
 	if (out)
 		*out = value;
+}
+
+static void
+jniTrace(const char *message)
+{
+#ifdef USE_JNI_BACKEND
+	const char *enabled = getenv("ORACLE_FDW_JNI_TRACE");
+
+	if (enabled && enabled[0] && strcmp(enabled, "0") != 0)
+	{
+		fprintf(stderr, "oracle_fdw_jni: %s\n", message);
+		fflush(stderr);
+	}
+#else
+	(void)message;
+#endif
+}
+
+static void
+jniDebug3(const char *message)
+{
+#ifndef USE_JNI_BACKEND
+	ereport(DEBUG3, (errmsg("%s", message)));
+#else
+	jniTrace(message);
+#endif
 }
 
 static void
@@ -107,6 +149,16 @@ mallocStrdup(const char *value)
 	return copy;
 }
 
+static char *
+errorDetailStrdup(const char *value)
+{
+#ifndef USE_JNI_BACKEND
+	return pstrdup(value ? value : "Java exception");
+#else
+	return mallocStrdup(value ? value : "Java exception");
+#endif
+}
+
 static void
 uppercaseAscii(char *value)
 {
@@ -133,7 +185,9 @@ oraTypeFromNames(const char *typename, const char *typeowner)
 	uppercaseAscii(type);
 	uppercaseAscii(owner);
 
-	if (startsWith(type, "VARCHAR"))
+	if (startsWith(type, "NVARCHAR"))
+		result = ORA_TYPE_NVARCHAR2;
+	else if (startsWith(type, "VARCHAR"))
 		result = ORA_TYPE_VARCHAR2;
 	else if (strcmp(type, "NUMBER") == 0)
 		result = ORA_TYPE_NUMBER;
@@ -164,8 +218,6 @@ oraTypeFromNames(const char *typename, const char *typeowner)
 		result = ORA_TYPE_XMLTYPE;
 	else if (strcmp(type, "FLOAT") == 0)
 		result = ORA_TYPE_FLOAT;
-	else if (startsWith(type, "NVARCHAR"))
-		result = ORA_TYPE_NVARCHAR2;
 	else if (strcmp(type, "NCHAR") == 0)
 		result = ORA_TYPE_NCHAR;
 	else if (startsWith(type, "INTERVAL DAY"))
@@ -240,18 +292,61 @@ jthrowableToDetail(JNIEnv *env, jthrowable throwable)
 	char *detail;
 
 	if (!throwable)
-		return mallocStrdup("Java exception");
+		return errorDetailStrdup("Java exception");
 
 	throwable_class = (*env)->GetObjectClass(env, throwable);
+	if (!throwable_class || (*env)->ExceptionCheck(env))
+	{
+		(*env)->ExceptionClear(env);
+		return errorDetailStrdup("Java exception; could not inspect Throwable class");
+	}
 	to_string_mid = (*env)->GetMethodID(env, throwable_class, "toString", "()Ljava/lang/String;");
+	if (!to_string_mid || (*env)->ExceptionCheck(env))
+	{
+		(*env)->ExceptionClear(env);
+		(*env)->DeleteLocalRef(env, throwable_class);
+		return errorDetailStrdup("Java exception; could not resolve Throwable.toString()");
+	}
 	text = (jstring)(*env)->CallObjectMethod(env, throwable, to_string_mid);
+	if ((*env)->ExceptionCheck(env))
+	{
+		(*env)->ExceptionClear(env);
+		if (throwable_class)
+			(*env)->DeleteLocalRef(env, throwable_class);
+		return errorDetailStrdup("Java exception; Throwable.toString() failed");
+	}
 	detail = jstringToMalloc(env, text);
 	if (text)
 		(*env)->DeleteLocalRef(env, text);
 	if (throwable_class)
 		(*env)->DeleteLocalRef(env, throwable_class);
 
-	return detail ? detail : mallocStrdup("Java exception");
+	if (!detail)
+		return errorDetailStrdup("Java exception");
+
+#ifndef USE_JNI_BACKEND
+	{
+		char *pg_detail = pstrdup(detail);
+		free(detail);
+		return pg_detail;
+	}
+#else
+	return detail;
+#endif
+}
+
+static void
+oracleError_d_jni(oraError sqlstate, const char *message, const char *detail)
+{
+#ifndef USE_JNI_BACKEND
+	(void)sqlstate;
+	ereport(ERROR,
+			(errcode(ERRCODE_FDW_ERROR),
+			 errmsg("%s", message),
+			 errdetail("%s", detail ? detail : "")));
+#else
+	oracleError_d(sqlstate, message, detail);
+#endif
 }
 
 static void
@@ -267,8 +362,11 @@ checkJava(JNIEnv *env, const char *message)
 		if (throwable)
 			(*env)->DeleteLocalRef(env, throwable);
 
-		oracleError_d(FDW_ERROR, message, detail);
+		jniDebug3(detail);
+		oracleError_d_jni(FDW_ERROR, message, detail);
+#ifdef USE_JNI_BACKEND
 		free(detail);
+#endif
 	}
 }
 
@@ -279,6 +377,47 @@ newJavaString(JNIEnv *env, const char *value)
 
 	checkJava(env, "error creating Java string in JNI backend");
 	return result;
+}
+
+static jbyteArray
+newJavaLengthPrefixedBytes(JNIEnv *env, const char *value)
+{
+	int32_t len;
+	jbyteArray result;
+
+	if (!value)
+		return NULL;
+
+	memcpy(&len, value, sizeof(len));
+	if (len < 0)
+		oracleError(FDW_ERROR, "JNI backend internal error: invalid length-prefixed bind value");
+
+	result = (*env)->NewByteArray(env, len + (jsize)sizeof(len));
+	checkJava(env, "error creating Java byte array in JNI backend");
+	(*env)->SetByteArrayRegion(env, result, 0, len + (jsize)sizeof(len), (const jbyte *)value);
+	checkJava(env, "error filling Java byte array in JNI backend");
+	return result;
+}
+
+static jobject
+newJavaBindValue(JNIEnv *env, struct paramDesc *param)
+{
+	if (!param->value || param->bindType == BIND_OUTPUT)
+		return NULL;
+
+	switch (param->bindType)
+	{
+		case BIND_LONG:
+		case BIND_LONGRAW:
+			return (jobject)newJavaLengthPrefixedBytes(env, param->value);
+		case BIND_GEOMETRY:
+			oracleError(FDW_ERROR, "JNI backend does not support binding Oracle geometry parameters yet");
+			break;
+		default:
+			return (jobject)newJavaString(env, param->value);
+	}
+
+	return NULL;
 }
 
 static char *
@@ -310,22 +449,24 @@ buildClasspath(void)
 static JNIEnv *
 getEnv(void)
 {
-	JNIEnv *env = NULL;
 	jint status;
 
 	if (!jvm)
 		return NULL;
 
-	status = (*jvm)->GetEnv(jvm, (void **)&env, JNI_VERSION_1_8);
+	status = (*jvm)->GetEnv(jvm, (void **)&jni_env, JNI_VERSION_1_8);
 	if (status == JNI_EDETACHED)
 	{
-		if ((*jvm)->AttachCurrentThread(jvm, (void **)&env, NULL) != JNI_OK)
+		jniDebug3("oracle_fdw_jni: In jdbc_attach_jvm");
+		if ((*jvm)->AttachCurrentThread(jvm, (void **)&jni_env, NULL) != JNI_OK)
 			oracleError(FDW_ERROR, "could not attach current thread to JVM");
 	}
+	else if (status == JNI_OK)
+		jniDebug3("oracle_fdw_jni: JVMEnvStat: JNI_OK");
 	else if (status != JNI_OK)
 		oracleError(FDW_ERROR, "could not get JNI environment");
 
-	return env;
+	return jni_env;
 }
 
 static void
@@ -344,12 +485,13 @@ ensureJvm(void)
 {
 	JNIEnv *env = getEnv();
 
+	jniDebug3("oracle_fdw_jni: In ensureJvm");
 	if (env)
 		return env;
 
 	{
 		JavaVMInitArgs args;
-		JavaVMOption options[2];
+		JavaVMOption options[3];
 		char *classpath = buildClasspath();
 		size_t cp_option_len = strlen("-Djava.class.path=") + strlen(classpath) + 1;
 		char *cp_option = (char *)malloc(cp_option_len);
@@ -362,13 +504,16 @@ ensureJvm(void)
 
 		options[0].optionString = cp_option;
 		options[1].optionString = "-Dfile.encoding=UTF-8";
+		options[2].optionString = "-Xrs";
 
 		memset(&args, 0, sizeof(args));
 		args.version = JNI_VERSION_1_8;
-		args.nOptions = 2;
+		args.nOptions = 3;
 		args.options = options;
 		args.ignoreUnrecognized = JNI_FALSE;
 
+		jniDebug3("oracle_fdw_jni: In jdbc_jvm_init");
+		jniDebug3("oracle_fdw_jni: In JNI_CreateJavaVM");
 		rc = JNI_CreateJavaVM(&jvm, (void **)&env, &args);
 		if (rc != JNI_OK)
 		{
@@ -377,61 +522,71 @@ ensureJvm(void)
 			snprintf(detail, sizeof(detail), "JNI_CreateJavaVM failed with code %d; classpath=%s", (int)rc, classpath);
 			free(classpath);
 			free(cp_option);
-			oracleError_d(FDW_ERROR, "could not create JVM for JDBC backend", detail);
+			oracleError_d_jni(FDW_ERROR, "could not create JVM for JDBC backend", detail);
 		}
+		jni_env = env;
+		jniDebug3("oracle_fdw_jni: In jdbc_attach_jvm");
+		if ((*jvm)->AttachCurrentThread(jvm, (void **)&jni_env, NULL) != JNI_OK)
+			oracleError(FDW_ERROR, "could not attach current thread to JVM");
 
-		local_class = (*env)->FindClass(env, "OracleJdbcBackend");
-		checkJava(env, "could not load OracleJdbcBackend Java class");
+		local_class = (*jni_env)->FindClass(jni_env, "OracleJdbcBackend");
+		checkJava(jni_env, "could not load OracleJdbcBackend Java class");
 		if (!local_class)
 			oracleError(FDW_ERROR, "OracleJdbcBackend Java class was not found");
-		backend_class = (jclass)(*env)->NewGlobalRef(env, local_class);
-		(*env)->DeleteLocalRef(env, local_class);
-		checkJava(env, "could not retain OracleJdbcBackend Java class");
+		backend_class = (jclass)(*jni_env)->NewGlobalRef(jni_env, local_class);
+		(*jni_env)->DeleteLocalRef(jni_env, local_class);
+		checkJava(jni_env, "could not retain OracleJdbcBackend Java class");
 
-		loadMethod(env, &ctor_mid, "<init>", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", 0);
-		loadMethod(env, &client_version_mid, "clientVersion", "()[I", 1);
-		loadMethod(env, &server_version_mid, "serverVersion", "()[I", 0);
-		loadMethod(env, &close_mid, "close", "()V", 0);
-		loadMethod(env, &close_statement_mid, "closeStatement", "()V", 0);
-		loadMethod(env, &is_statement_open_mid, "isStatementOpen", "()Z", 0);
-		loadMethod(env, &describe_mid, "describe", "(Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;", 0);
-		loadMethod(env, &prepare_query_mid, "prepareQuery", "(Ljava/lang/String;)V", 0);
-		loadMethod(env, &execute_query_mid, "executeQuery", "()I", 0);
-		loadMethod(env, &fetch_next_mid, "fetchNext", "()Z", 0);
-		loadMethod(env, &get_value_mid, "getValue", "(I)Ljava/lang/String;", 0);
-		loadMethod(env, &execute_call_mid, "executeCall", "(Ljava/lang/String;)V", 0);
-		loadMethod(env, &end_transaction_mid, "endTransaction", "(Z)V", 0);
-		loadMethod(env, &rollback_to_savepoint_mid, "rollbackToSavepoint", "(I)V", 0);
-		loadMethod(env, &explain_mid, "explain", "(Ljava/lang/String;)[Ljava/lang/String;", 0);
-		loadMethod(env, &load_import_columns_mid, "loadImportColumns", "(Ljava/lang/String;Ljava/lang/String;III)V", 0);
-		loadMethod(env, &get_import_column_next_mid, "getImportColumnNext", "()Ljava/lang/String;", 0);
+		loadMethod(jni_env, &ctor_mid, "<init>", "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)V", 0);
+		loadMethod(jni_env, &client_version_mid, "clientVersion", "()[I", 1);
+		loadMethod(jni_env, &server_version_mid, "serverVersion", "()[I", 0);
+		loadMethod(jni_env, &close_mid, "close", "()V", 0);
+		loadMethod(jni_env, &close_statement_mid, "closeStatement", "()V", 0);
+		loadMethod(jni_env, &is_statement_open_mid, "isStatementOpen", "()Z", 0);
+		loadMethod(jni_env, &describe_mid, "describe", "(Ljava/lang/String;Ljava/lang/String;)[Ljava/lang/String;", 0);
+		loadMethod(jni_env, &prepare_query_mid, "prepareQuery", "(Ljava/lang/String;)V", 0);
+		loadMethod(jni_env, &execute_query_mid, "executeQuery", "()I", 0);
+		loadMethod(jni_env, &execute_query_with_params_mid, "executeQuery", "([Ljava/lang/String;[I[Ljava/lang/Object;)I", 0);
+		loadMethod(jni_env, &fetch_next_mid, "fetchNext", "()Z", 0);
+		loadMethod(jni_env, &get_value_mid, "getValue", "(I)Ljava/lang/String;", 0);
+		loadMethod(jni_env, &execute_call_mid, "executeCall", "(Ljava/lang/String;)V", 0);
+		loadMethod(jni_env, &end_transaction_mid, "endTransaction", "(Z)V", 0);
+		loadMethod(jni_env, &rollback_to_savepoint_mid, "rollbackToSavepoint", "(I)V", 0);
+		loadMethod(jni_env, &explain_mid, "explain", "(Ljava/lang/String;)[Ljava/lang/String;", 0);
+		loadMethod(jni_env, &load_import_columns_mid, "loadImportColumns", "(Ljava/lang/String;Ljava/lang/String;III)V", 0);
+		loadMethod(jni_env, &get_import_column_next_mid, "getImportColumnNext", "()Ljava/lang/String;", 0);
 
 		free(classpath);
 		free(cp_option);
 	}
 
-	return env;
+	return jni_env;
 }
 
 static void
-registerSession(oracleSession *session)
+registerSession(JniSessionState *state)
 {
 	if (session_count == session_capacity)
 	{
+		void *new_sessions;
+
 		session_capacity = session_capacity ? session_capacity * 2 : 8;
-		sessions = (oracleSession **)oracleRealloc(sessions, session_capacity * sizeof(*sessions));
+		new_sessions = realloc(sessions, session_capacity * sizeof(*sessions));
+		if (!new_sessions)
+			oracleError(FDW_OUT_OF_MEMORY, "out of memory growing JNI connection cache");
+		sessions = (JniSessionState **)new_sessions;
 	}
-	sessions[session_count++] = session;
+	sessions[session_count++] = state;
 }
 
 static void
-unregisterSession(oracleSession *session)
+unregisterSession(JniSessionState *state)
 {
 	size_t i;
 
 	for (i = 0; i < session_count; ++i)
 	{
-		if (sessions[i] == session)
+		if (sessions[i] == state)
 		{
 			sessions[i] = sessions[session_count - 1];
 			--session_count;
@@ -467,17 +622,21 @@ freeLobs(JniSessionState *state)
 }
 
 static void
-dropSession(oracleSession *session)
+dropState(JniSessionState *state)
 {
 	JNIEnv *env;
-	JniSessionState *state;
 
-	if (!session)
+	if (!state)
 		return;
 
-	state = (JniSessionState *)session->thin_runtime;
+	if (state->callback_registered)
+	{
+		oracleUnregisterCallback(state);
+		state->callback_registered = 0;
+	}
+
 	env = getEnv();
-	if (env && state && state->backend)
+	if (env && state->backend)
 	{
 		(*env)->CallVoidMethod(env, state->backend, close_mid);
 		checkJava(env, "error closing JDBC backend connection");
@@ -486,10 +645,8 @@ dropSession(oracleSession *session)
 	}
 
 	freeLobs(state);
-	if (state)
-		oracleFree(state);
-	unregisterSession(session);
-	oracleFree(session);
+	unregisterSession(state);
+	free(state);
 }
 
 static void
@@ -627,7 +784,9 @@ oracleGetSession(const char *connectstring, oraIsoLevel isolation_level, char *u
 
 	session = (oracleSession *)oracleAlloc(sizeof(*session));
 	memset(session, 0, sizeof(*session));
-	state = (JniSessionState *)oracleAlloc(sizeof(*state));
+	state = (JniSessionState *)malloc(sizeof(*state));
+	if (!state)
+		oracleError(FDW_OUT_OF_MEMORY, "out of memory allocating JNI session state");
 	memset(state, 0, sizeof(*state));
 
 	state->backend = (*env)->NewGlobalRef(env, local_backend);
@@ -648,7 +807,9 @@ oracleGetSession(const char *connectstring, oraIsoLevel isolation_level, char *u
 	(*env)->DeleteLocalRef(env, j_user);
 	(*env)->DeleteLocalRef(env, j_password);
 
-	registerSession(session);
+	registerSession(state);
+	oracleRegisterCallback(state);
+	state->callback_registered = 1;
 	return session;
 }
 
@@ -684,7 +845,10 @@ void
 oracleCloseConnections(void)
 {
 	while (session_count > 0)
-		dropSession(sessions[session_count - 1]);
+		dropState(sessions[session_count - 1]);
+	free(sessions);
+	sessions = NULL;
+	session_capacity = 0;
 }
 
 void
@@ -701,30 +865,21 @@ oracleCancel(void)
 void
 oracleEndTransaction(void *arg, int is_commit, int silent)
 {
-	oracleSession *session = (oracleSession *)arg;
-	JNIEnv *env = ensureJvm();
-	JniSessionState *state = getState(session);
-
+	(void)arg;
+	(void)is_commit;
 	(void)silent;
 
-	(*env)->CallVoidMethod(env, state->backend, end_transaction_mid, is_commit ? JNI_TRUE : JNI_FALSE);
-	checkJava(env, "error ending JDBC backend transaction");
+	jniTrace("oracleEndTransaction callback no-op for JNI backend");
 }
 
 void
 oracleEndSubtransaction(void *arg, int nest_level, int is_commit)
 {
-	oracleSession *session = (oracleSession *)arg;
-	JNIEnv *env;
-	JniSessionState *state;
+	(void)arg;
+	(void)nest_level;
+	(void)is_commit;
 
-	if (is_commit)
-		return;
-
-	env = ensureJvm();
-	state = getState(session);
-	(*env)->CallVoidMethod(env, state->backend, rollback_to_savepoint_mid, (jint)nest_level);
-	checkJava(env, "error rolling back JDBC backend subtransaction");
+	jniTrace("oracleEndSubtransaction callback no-op for JNI backend");
 }
 
 int
@@ -770,7 +925,7 @@ oracleDescribe(oracleSession *session, char *dblink, char *schema, char *table, 
 	result->name = oracleStrdup(table);
 	result->pgname = oracleStrdup(pgname && pgname[0] ? pgname : table);
 	result->ncols = (int)row_count;
-	result->npgcols = (int)row_count;
+	result->npgcols = 0;
 	result->cols = (struct oraColumn **)oracleAlloc(sizeof(struct oraColumn *) * (size_t)row_count);
 
 	for (i = 0; i < row_count; ++i)
@@ -793,12 +948,12 @@ oracleDescribe(oracleSession *session, char *dblink, char *schema, char *table, 
 		column = (struct oraColumn *)oracleAlloc(sizeof(*column));
 		memset(column, 0, sizeof(*column));
 		column->name = oracleStrdup(fields[0]);
-		column->pgname = oracleStrdup(fields[0]);
+		column->pgname = NULL;
 		column->oratype = type;
 		column->scale = parseIntOrZero(fields[4]);
-		column->pgattnum = i + 1;
-		column->pgtypmod = -1;
-		column->used = 1;
+		column->pgattnum = 0;
+		column->pgtypmod = 0;
+		column->used = 0;
 		column->val_size = valSizeForType(type, data_length, max_long);
 		result->cols[i] = column;
 
@@ -879,15 +1034,87 @@ oracleExecuteQuery(oracleSession *session, const struct oraTable *oraTable, stru
 {
 	JNIEnv *env = ensureJvm();
 	JniSessionState *state = getState(session);
+	struct paramDesc *param;
+	jobjectArray names = NULL;
+	jintArray types = NULL;
+	jobjectArray values = NULL;
+	jclass string_class = NULL;
+	jclass object_class = NULL;
+	jint *type_values = NULL;
+	int param_count = 0;
+	int param_index = 0;
 	jint processed;
 
-	(void)paramList;
 	(void)prefetch;
+
+	for (param = paramList; param; param = param->next)
+		++param_count;
 
 	state->current_table = oraTable;
 	state->next_row = 0;
-	processed = (*env)->CallIntMethod(env, state->backend, execute_query_mid);
+
+	if (param_count == 0)
+	{
+		processed = (*env)->CallIntMethod(env, state->backend, execute_query_mid);
+	}
+	else
+	{
+		string_class = (*env)->FindClass(env, "java/lang/String");
+		checkJava(env, "error loading Java String class in JNI backend");
+		object_class = (*env)->FindClass(env, "java/lang/Object");
+		checkJava(env, "error loading Java Object class in JNI backend");
+
+		names = (*env)->NewObjectArray(env, param_count, string_class, NULL);
+		checkJava(env, "error creating JDBC bind name array");
+		types = (*env)->NewIntArray(env, param_count);
+		checkJava(env, "error creating JDBC bind type array");
+		values = (*env)->NewObjectArray(env, param_count, object_class, NULL);
+		checkJava(env, "error creating JDBC bind value array");
+
+		type_values = (jint *)oracleAlloc((size_t)param_count * sizeof(jint));
+		for (param = paramList; param; param = param->next)
+		{
+			jstring name;
+			jobject value;
+
+			name = newJavaString(env, param->name);
+			(*env)->SetObjectArrayElement(env, names, param_index, name);
+			checkJava(env, "error setting JDBC bind name");
+			(*env)->DeleteLocalRef(env, name);
+
+			type_values[param_index] = (jint)param->bindType;
+
+			value = newJavaBindValue(env, param);
+			if (value)
+			{
+				(*env)->SetObjectArrayElement(env, values, param_index, value);
+				checkJava(env, "error setting JDBC bind value");
+				(*env)->DeleteLocalRef(env, value);
+			}
+
+			++param_index;
+		}
+
+		(*env)->SetIntArrayRegion(env, types, 0, param_count, type_values);
+		checkJava(env, "error setting JDBC bind type array");
+
+		processed = (*env)->CallIntMethod(env, state->backend, execute_query_with_params_mid,
+										  names, types, values);
+	}
 	checkJava(env, "error executing Oracle query through JDBC backend");
+
+	if (type_values)
+		oracleFree(type_values);
+	if (values)
+		(*env)->DeleteLocalRef(env, values);
+	if (types)
+		(*env)->DeleteLocalRef(env, types);
+	if (names)
+		(*env)->DeleteLocalRef(env, names);
+	if (object_class)
+		(*env)->DeleteLocalRef(env, object_class);
+	if (string_class)
+		(*env)->DeleteLocalRef(env, string_class);
 
 	session->thin_result = state->backend;
 	session->fetched_rows = (unsigned int)(processed < 0 ? 0 : processed);
@@ -947,6 +1174,8 @@ oracleExecuteCall(oracleSession *session, char * const stmt)
 	JniSessionState *state = getState(session);
 	jstring j_stmt = newJavaString(env, stmt);
 
+	if ((*env)->ExceptionCheck(env))
+		(*env)->ExceptionClear(env);
 	(*env)->CallVoidMethod(env, state->backend, execute_call_mid, j_stmt);
 	checkJava(env, "error executing Oracle statement through JDBC backend");
 	(*env)->DeleteLocalRef(env, j_stmt);

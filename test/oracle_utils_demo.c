@@ -417,6 +417,11 @@ main(int argc, char **argv)
 	runLobQuery(session);
 	oracleExecuteCall(session, "BEGIN NULL; END;");
 	printf("oracleExecuteCall.done\n");
+	if (envIsEnabled("ORACLE_DEMO_ERROR_PATH"))
+	{
+		oracleExecuteCall(session, "DROP TABLE scott.codex_jni_missing_table PURGE");
+		printf("oracleExecuteCall.error_path.unexpected_success\n");
+	}
 
 	runImportColumns(session, schema, describe_table);
 

@@ -1,5 +1,5 @@
 CREATE FUNCTION oracle_execute(server name, statement text) RETURNS void
-AS 'MODULE_PATHNAME'
+AS 'MODULE_PATHNAME', 'oracle_execute_oci'
 LANGUAGE C STRICT;
 
 COMMENT ON FUNCTION oracle_execute(name, text)

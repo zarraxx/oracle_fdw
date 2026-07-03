@@ -42,6 +42,10 @@ What currently exists:
 - CMake builds three demo executables when `ORACLE_FDW_BUILD_UTILS_DEMO` is ON:
   `oracle_utils_demo_oci`, `oracle_utils_demo_rust`, and
   `oracle_utils_demo_jni`.
+- CMake also builds an experimental PostgreSQL extension module
+  `oracle_jni_fdw` when `ORACLE_FDW_BUILD_JNI_FDW` is ON. It uses
+  `oracle_jni_fdw.control` and a separate `oracle_jni_fdw` foreign data wrapper
+  name so it can be installed beside the OCI `oracle_fdw` extension.
 - `jni_backend/oracle_utils_jni.c` exports the same demo-facing
   `oracle_utils.c` ABI and calls `OracleJdbcBackend` through JNI.
 - The JNI demo currently covers connect, client/server version, describe,

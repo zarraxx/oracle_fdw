@@ -6,6 +6,11 @@ import java.sql.PreparedStatement;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.sql.Statement;
+import java.sql.Types;
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -29,9 +34,12 @@ public final class OracleJdbcBackend {
     private int nextImportRow;
 
     public OracleJdbcBackend(String connectString, String user, String password) throws SQLException {
-        String jdbcUrl = connectString.startsWith("jdbc:")
-                ? connectString
-                : "jdbc:oracle:thin:@" + connectString;
+        String target = (connectString == null || connectString.isBlank())
+                ? defaultConnectString()
+                : connectString;
+        String jdbcUrl = target.startsWith("jdbc:")
+                ? target
+                : "jdbc:oracle:thin:@" + target;
 
         this.connection = DriverManager.getConnection(jdbcUrl, user, password);
         this.connection.setAutoCommit(false);
@@ -42,6 +50,16 @@ public final class OracleJdbcBackend {
     public static int[] clientVersion() throws SQLException {
         Driver driver = DriverManager.getDriver("jdbc:oracle:thin:@");
         return new int[] {driver.getMajorVersion(), driver.getMinorVersion(), 0, 0, 0};
+    }
+
+    private static String defaultConnectString() {
+        for (String name : new String[] {"LOCAL", "TWO_TASK", "ORACLE_FDW_CONNECT_STRING"}) {
+            String value = System.getenv(name);
+            if (value != null && !value.isBlank()) {
+                return value;
+            }
+        }
+        return "";
     }
 
     public int[] serverVersion() throws SQLException {
@@ -91,7 +109,10 @@ public final class OracleJdbcBackend {
         String ownerClause = (schema == null || schema.isEmpty())
                 ? "SYS_CONTEXT('USERENV','CURRENT_SCHEMA')"
                 : sqlLiteral(schema);
-        String sql = "SELECT column_name, data_type, data_length, data_precision, data_scale, nullable, data_type_owner "
+        String sql = "SELECT column_name, data_type, "
+                + "CASE WHEN data_type IN ('CHAR', 'NCHAR', 'VARCHAR2', 'NVARCHAR2') "
+                + "     THEN NVL(char_col_decl_length, data_length) ELSE data_length END, "
+                + "data_precision, data_scale, nullable, data_type_owner "
                 + "FROM all_tab_cols "
                 + "WHERE owner = " + ownerClause + " AND table_name = " + sqlLiteral(table)
                 + " AND hidden_column = 'NO' "
@@ -120,9 +141,15 @@ public final class OracleJdbcBackend {
     }
 
     public int executeQuery() throws SQLException {
+        return executeQuery(null, null, null);
+    }
+
+    public int executeQuery(String[] names, int[] types, Object[] values) throws SQLException {
         if (preparedStatement == null) {
             throw new SQLException("statement is not prepared");
         }
+
+        bindParameters(names, types, values);
 
         rows = new ArrayList<>();
         nextRow = 0;
@@ -146,6 +173,138 @@ public final class OracleJdbcBackend {
         return preparedStatement.getUpdateCount();
     }
 
+    private void bindParameters(String[] names, int[] types, Object[] values) throws SQLException {
+        if (names == null || names.length == 0) {
+            return;
+        }
+        if (types == null || values == null || types.length != names.length || values.length != names.length) {
+            throw new SQLException("invalid JDBC bind parameter arrays");
+        }
+
+        for (int i = 0; i < names.length; i++) {
+            int index = bindIndexOrFallback(names[i], i + 1);
+            if (values[i] == null) {
+                setNullAtNameOrIndex(names[i], index, jdbcType(types[i]));
+                continue;
+            }
+
+            switch (types[i]) {
+                case 1:
+                    bindAtNameOrIndex("setBigDecimalAtName", new Class<?>[] {String.class, BigDecimal.class},
+                            names[i], index, new BigDecimal(values[i].toString()));
+                    break;
+                case 2:
+                    bindAtNameOrIndex("setStringAtName", new Class<?>[] {String.class, String.class},
+                            names[i], index, longValueString((byte[]) values[i]));
+                    break;
+                case 3:
+                    bindAtNameOrIndex("setBytesAtName", new Class<?>[] {String.class, byte[].class},
+                            names[i], index, longValueBytes((byte[]) values[i]));
+                    break;
+                default:
+                    bindAtNameOrIndex("setStringAtName", new Class<?>[] {String.class, String.class},
+                            names[i], index, values[i].toString());
+                    break;
+            }
+        }
+    }
+
+    private static int bindIndexOrFallback(String name, int fallback) {
+        if (name == null || name.length() < 3 || name.charAt(0) != ':' || name.charAt(1) != 'p') {
+            return fallback;
+        }
+        try {
+            return Integer.parseInt(name.substring(2));
+        } catch (NumberFormatException ex) {
+            return fallback;
+        }
+    }
+
+    private static int jdbcType(int bindType) {
+        switch (bindType) {
+            case 1:
+                return Types.NUMERIC;
+            case 2:
+                return Types.LONGVARCHAR;
+            case 3:
+                return Types.LONGVARBINARY;
+            default:
+                return Types.VARCHAR;
+        }
+    }
+
+    private void bindAtNameOrIndex(String methodName, Class<?>[] parameterTypes, String name, int index, Object value)
+            throws SQLException {
+        if (bindAtName(methodName, parameterTypes, name, value)) {
+            return;
+        }
+
+        if (value instanceof BigDecimal) {
+            preparedStatement.setBigDecimal(index, (BigDecimal) value);
+        } else if (value instanceof byte[]) {
+            preparedStatement.setBytes(index, (byte[]) value);
+        } else {
+            preparedStatement.setString(index, value.toString());
+        }
+    }
+
+    private void setNullAtNameOrIndex(String name, int index, int sqlType) throws SQLException {
+        if (bindAtName("setNullAtName", new Class<?>[] {String.class, int.class}, name, sqlType)) {
+            return;
+        }
+
+        preparedStatement.setNull(index, sqlType);
+    }
+
+    private boolean bindAtName(String methodName, Class<?>[] parameterTypes, String name, Object value) {
+        try {
+            Method method = preparedStatement.getClass().getMethod(methodName, parameterTypes);
+            method.invoke(preparedStatement, bindName(name), value);
+            return true;
+        } catch (NoSuchMethodException ignored) {
+            return false;
+        } catch (IllegalAccessException | InvocationTargetException ignored) {
+        }
+
+        if (name == null || !name.startsWith(":")) {
+            return false;
+        }
+
+        try {
+            Method method = preparedStatement.getClass().getMethod(methodName, parameterTypes);
+            method.invoke(preparedStatement, name, value);
+            return true;
+        } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException ignored) {
+            return false;
+        }
+    }
+
+    private static String bindName(String name) {
+        return name != null && name.startsWith(":") ? name.substring(1) : name;
+    }
+
+    private static byte[] longValueBytes(byte[] raw) {
+        if (raw.length < 4) {
+            return raw;
+        }
+
+        int len = (raw[0] & 0xff)
+                | ((raw[1] & 0xff) << 8)
+                | ((raw[2] & 0xff) << 16)
+                | ((raw[3] & 0xff) << 24);
+        if (len < 0 || len > raw.length - 4) {
+            return raw;
+        }
+
+        byte[] data = new byte[len];
+        System.arraycopy(raw, 4, data, 0, len);
+        return data;
+    }
+
+    private static String longValueString(byte[] raw) {
+        return new String(longValueBytes(raw), StandardCharsets.UTF_8);
+    }
+
     public boolean fetchNext() {
         if (nextRow >= rows.size()) {
             currentRow = null;
@@ -165,6 +324,15 @@ public final class OracleJdbcBackend {
     public void executeCall(String sql) throws SQLException {
         try (Statement stmt = connection.createStatement()) {
             stmt.execute(sql);
+        }
+    }
+
+    public String executeCallWithError(String sql) {
+        try {
+            executeCall(sql);
+            return null;
+        } catch (SQLException ex) {
+            return ex.toString();
         }
     }
 

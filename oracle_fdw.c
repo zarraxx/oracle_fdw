@@ -160,8 +160,30 @@
 #define table_close(x, y) heap_close(x, y)
 #endif  /* PG_VERSION_NUM */
 
+#ifndef ORACLE_FDW_MODULE_NAME
+#define ORACLE_FDW_MODULE_NAME oracle_fdw
+#endif
+#define ORACLE_FDW_STRINGIFY_(x) #x
+#define ORACLE_FDW_STRINGIFY(x) ORACLE_FDW_STRINGIFY_(x)
+
+#ifndef ORACLE_FDW_HANDLER
+#define ORACLE_FDW_HANDLER oracle_fdw_handler_oci
+#endif
+#ifndef ORACLE_FDW_VALIDATOR
+#define ORACLE_FDW_VALIDATOR oracle_fdw_validator_oci
+#endif
+#ifndef ORACLE_FDW_CLOSE_CONNECTIONS
+#define ORACLE_FDW_CLOSE_CONNECTIONS oracle_close_connections_oci
+#endif
+#ifndef ORACLE_FDW_DIAG
+#define ORACLE_FDW_DIAG oracle_diag_oci
+#endif
+#ifndef ORACLE_FDW_EXECUTE
+#define ORACLE_FDW_EXECUTE oracle_execute_oci
+#endif
+
 #if PG_VERSION_NUM >= 180000
-PG_MODULE_MAGIC_EXT(.name = "oracle_fdw", .version = ORACLE_FDW_VERSION);
+PG_MODULE_MAGIC_EXT(.name = ORACLE_FDW_STRINGIFY(ORACLE_FDW_MODULE_NAME), .version = ORACLE_FDW_VERSION);
 #else
 PG_MODULE_MAGIC;
 #endif
@@ -313,17 +335,17 @@ struct OracleFdwState {
 /*
  * SQL functions
  */
-extern PGDLLEXPORT Datum oracle_fdw_handler(PG_FUNCTION_ARGS);
-extern PGDLLEXPORT Datum oracle_fdw_validator(PG_FUNCTION_ARGS);
-extern PGDLLEXPORT Datum oracle_close_connections(PG_FUNCTION_ARGS);
-extern PGDLLEXPORT Datum oracle_diag(PG_FUNCTION_ARGS);
-extern PGDLLEXPORT Datum oracle_execute(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum ORACLE_FDW_HANDLER(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum ORACLE_FDW_VALIDATOR(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum ORACLE_FDW_CLOSE_CONNECTIONS(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum ORACLE_FDW_DIAG(PG_FUNCTION_ARGS);
+extern PGDLLEXPORT Datum ORACLE_FDW_EXECUTE(PG_FUNCTION_ARGS);
 
-PG_FUNCTION_INFO_V1(oracle_fdw_handler);
-PG_FUNCTION_INFO_V1(oracle_fdw_validator);
-PG_FUNCTION_INFO_V1(oracle_close_connections);
-PG_FUNCTION_INFO_V1(oracle_diag);
-PG_FUNCTION_INFO_V1(oracle_execute);
+PG_FUNCTION_INFO_V1(ORACLE_FDW_HANDLER);
+PG_FUNCTION_INFO_V1(ORACLE_FDW_VALIDATOR);
+PG_FUNCTION_INFO_V1(ORACLE_FDW_CLOSE_CONNECTIONS);
+PG_FUNCTION_INFO_V1(ORACLE_FDW_DIAG);
+PG_FUNCTION_INFO_V1(ORACLE_FDW_EXECUTE);
 
 /*
  * on-load initializer
@@ -449,7 +471,7 @@ static void interval2itm(Interval span, struct pg_itm *itm);
  * to callback routines.
  */
 PGDLLEXPORT Datum
-oracle_fdw_handler(PG_FUNCTION_ARGS)
+ORACLE_FDW_HANDLER(PG_FUNCTION_ARGS)
 {
 	FdwRoutine *fdwroutine = makeNode(FdwRoutine);
 
@@ -494,7 +516,7 @@ oracle_fdw_handler(PG_FUNCTION_ARGS)
  * 		or a required option is missing.
  */
 PGDLLEXPORT Datum
-oracle_fdw_validator(PG_FUNCTION_ARGS)
+ORACLE_FDW_VALIDATOR(PG_FUNCTION_ARGS)
 {
 	List *options_list = untransformRelOptions(PG_GETARG_DATUM(0));
 	Oid catalog = PG_GETARG_OID(1);
@@ -659,7 +681,7 @@ oracle_fdw_validator(PG_FUNCTION_ARGS)
  * 		Close all open Oracle connections.
  */
 PGDLLEXPORT Datum
-oracle_close_connections(PG_FUNCTION_ARGS)
+ORACLE_FDW_CLOSE_CONNECTIONS(PG_FUNCTION_ARGS)
 {
 	if (dml_in_transaction)
 		ereport(ERROR,
@@ -680,7 +702,7 @@ oracle_close_connections(PG_FUNCTION_ARGS)
  * 		In this case, the remote server version is returned as well.
  */
 PGDLLEXPORT Datum
-oracle_diag(PG_FUNCTION_ARGS)
+ORACLE_FDW_DIAG(PG_FUNCTION_ARGS)
 {
 	char *pgversion;
 	int major, minor, update, patch, port_patch;
@@ -697,7 +719,8 @@ oracle_diag(PG_FUNCTION_ARGS)
 	oracleClientVersion(&major, &minor, &update, &patch, &port_patch);
 
 	initStringInfo(&version);
-	appendStringInfo(&version, "oracle_fdw %s, PostgreSQL %s, Oracle client %d.%d.%d.%d.%d",
+	appendStringInfo(&version, "%s %s, PostgreSQL %s, Oracle client %d.%d.%d.%d.%d",
+					ORACLE_FDW_STRINGIFY(ORACLE_FDW_MODULE_NAME),
 					ORACLE_FDW_VERSION,
 					pgversion,
 					major, minor, update, patch, port_patch);
@@ -747,7 +770,7 @@ oracle_diag(PG_FUNCTION_ARGS)
  * 		Execute a statement that returns no result values on a foreign server.
  */
 PGDLLEXPORT Datum
-oracle_execute(PG_FUNCTION_ARGS)
+ORACLE_FDW_EXECUTE(PG_FUNCTION_ARGS)
 {
 	Name srvname = PG_GETARG_NAME(0);
 	char *stmt = text_to_cstring(PG_GETARG_TEXT_PP(1));

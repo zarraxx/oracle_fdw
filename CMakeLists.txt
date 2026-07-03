@@ -30,6 +30,7 @@ set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED OFF)
 set(CMAKE_C_EXTENSIONS ON)
 
+option(ORACLE_FDW_BUILD_JNI_FDW "Build oracle_jni_fdw PostgreSQL extension module" ON)
 option(ORACLE_FDW_BUILD_UTILS_DEMO "Build oracle_utils behavior comparison demo executables" ON)
 
 if(ORACLE_FDW_VERBOSE_BUILD AND CMAKE_GENERATOR MATCHES "Ninja")
@@ -44,6 +45,10 @@ set(ORACLE_FDW_SQL_FILES
   oracle_fdw--1.2.sql
   oracle_fdw--1.0--1.1.sql
   oracle_fdw--1.1--1.2.sql
+)
+
+set(ORACLE_JNI_FDW_SQL_FILES
+  oracle_jni_fdw--1.0.sql
 )
 
 set(ORACLE_FDW_SOURCES
@@ -177,6 +182,14 @@ endif()
 
 add_library(oracle_fdw MODULE ${ORACLE_FDW_SOURCES})
 
+target_compile_definitions(oracle_fdw PRIVATE
+  ORACLE_FDW_HANDLER=oracle_fdw_handler_oci
+  ORACLE_FDW_VALIDATOR=oracle_fdw_validator_oci
+  ORACLE_FDW_CLOSE_CONNECTIONS=oracle_close_connections_oci
+  ORACLE_FDW_DIAG=oracle_diag_oci
+  ORACLE_FDW_EXECUTE=oracle_execute_oci
+)
+
 target_include_directories(oracle_fdw PRIVATE
   "${CMAKE_CURRENT_SOURCE_DIR}"
   ${POSTGRESQL_INCLUDE_DIRS}
@@ -200,11 +213,9 @@ if(MSVC)
   target_link_options(oracle_fdw PRIVATE /DELAYLOAD:oci.dll)
 endif()
 
-if(ORACLE_FDW_BUILD_UTILS_DEMO)
-  find_program(CARGO_EXECUTABLE cargo REQUIRED)
-
+if(ORACLE_FDW_BUILD_JNI_FDW OR ORACLE_FDW_BUILD_UTILS_DEMO)
   if(NOT DEFINED ENV{JDK17_HOME} OR "$ENV{JDK17_HOME}" STREQUAL "")
-    message(FATAL_ERROR "Environment variable JDK17_HOME must be set when ORACLE_FDW_BUILD_UTILS_DEMO is ON.")
+    message(FATAL_ERROR "Environment variable JDK17_HOME must be set when ORACLE_FDW_BUILD_JNI_FDW or ORACLE_FDW_BUILD_UTILS_DEMO is ON.")
   endif()
   file(TO_CMAKE_PATH "$ENV{JDK17_HOME}" JDK17_HOME)
   find_program(JAVA_EXECUTABLE
@@ -274,6 +285,46 @@ if(ORACLE_FDW_BUILD_UTILS_DEMO)
     VERBATIM
   )
   add_custom_target(oracle_jni_java DEPENDS "${ORACLE_FDW_JNI_BRIDGE_JAR}")
+endif()
+
+if(ORACLE_FDW_BUILD_JNI_FDW)
+  add_library(oracle_jni_fdw MODULE
+    oracle_fdw.c
+    jni_backend/oracle_utils_jni.c
+    jni_backend/oracle_gis_stub.c
+  )
+
+  add_dependencies(oracle_jni_fdw oracle_jni_java)
+  target_compile_definitions(oracle_jni_fdw PRIVATE
+    ORACLE_FDW_MODULE_NAME=oracle_jni_fdw
+    ORACLE_FDW_HANDLER=oracle_fdw_handler_jni
+    ORACLE_FDW_VALIDATOR=oracle_fdw_validator_jni
+    ORACLE_FDW_CLOSE_CONNECTIONS=oracle_close_connections_jni
+    ORACLE_FDW_DIAG=oracle_diag_jni
+    ORACLE_FDW_EXECUTE=oracle_execute_jni
+    ORACLE_FDW_JNI_BRIDGE_JAR="${ORACLE_FDW_JNI_BRIDGE_JAR}"
+    ORACLE_FDW_DEFAULT_JDBC_JAR="${ORACLE_FDW_DEFAULT_JDBC_JAR}"
+  )
+  target_include_directories(oracle_jni_fdw PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}"
+    ${POSTGRESQL_INCLUDE_DIRS}
+    ${JDK17_INCLUDE_DIRS}
+  )
+  target_compile_options(oracle_jni_fdw PRIVATE ${PG_CFLAGS_LIST})
+  target_link_libraries(oracle_jni_fdw PRIVATE ${JVM_LIBRARY})
+  if(POSTGRESQL_LIBRARY)
+    target_link_libraries(oracle_jni_fdw PRIVATE ${POSTGRESQL_LIBRARY})
+  endif()
+  target_link_options(oracle_jni_fdw PRIVATE ${PG_LDFLAGS_LIST})
+
+  if(MSVC)
+    target_compile_definitions(oracle_jni_fdw PRIVATE _CRT_SECURE_NO_WARNINGS)
+    target_compile_options(oracle_jni_fdw PRIVATE /W4 /wd4200 /wd4244 /wd4267 /wd4389 /wd4018 /wd4996 /wd4100 /wd4127)
+  endif()
+endif()
+
+if(ORACLE_FDW_BUILD_UTILS_DEMO)
+  find_program(CARGO_EXECUTABLE cargo REQUIRED)
 
   set(ORACLE_RS_CARGO_PROFILE_DIR debug)
   set(ORACLE_RS_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/rust_backend/oracle-rs")
@@ -443,8 +494,18 @@ set_target_properties(oracle_fdw PROPERTIES
   OUTPUT_NAME "oracle_fdw"
 )
 
+if(TARGET oracle_jni_fdw)
+  set_target_properties(oracle_jni_fdw PROPERTIES
+    PREFIX ""
+    OUTPUT_NAME "oracle_jni_fdw"
+  )
+endif()
+
 if(WIN32)
   set_target_properties(oracle_fdw PROPERTIES SUFFIX ".dll")
+  if(TARGET oracle_jni_fdw)
+    set_target_properties(oracle_jni_fdw PROPERTIES SUFFIX ".dll")
+  endif()
 endif()
 
 set(ORACLE_FDW_PKGLIBDIR "${PG_PKGLIBDIR}" CACHE PATH "PostgreSQL pkglibdir for oracle_fdw library installation")
@@ -466,9 +527,25 @@ install(TARGETS oracle_fdw
   RUNTIME DESTINATION "${ORACLE_FDW_PKGLIBDIR}"
 )
 
+if(TARGET oracle_jni_fdw)
+  install(TARGETS oracle_jni_fdw
+    LIBRARY DESTINATION "${ORACLE_FDW_PKGLIBDIR}"
+    RUNTIME DESTINATION "${ORACLE_FDW_PKGLIBDIR}"
+  )
+  install(FILES "${ORACLE_FDW_JNI_BRIDGE_JAR}"
+    DESTINATION "${ORACLE_FDW_PKGLIBDIR}"
+  )
+endif()
+
 install(FILES oracle_fdw.control ${ORACLE_FDW_SQL_FILES}
   DESTINATION "${ORACLE_FDW_EXTENSIONDIR}"
 )
+
+if(TARGET oracle_jni_fdw)
+  install(FILES oracle_jni_fdw.control ${ORACLE_JNI_FDW_SQL_FILES}
+    DESTINATION "${ORACLE_FDW_EXTENSIONDIR}"
+  )
+endif()
 
 install(FILES README.oracle_fdw
   DESTINATION "${ORACLE_FDW_DOCDIR}"
