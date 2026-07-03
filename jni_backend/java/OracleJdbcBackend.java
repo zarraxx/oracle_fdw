@@ -27,6 +27,7 @@ public final class OracleJdbcBackend {
 
     private final Connection connection;
     private PreparedStatement preparedStatement;
+    private List<String> bindOrder;
     private List<String[]> rows;
     private int nextRow;
     private String[] currentRow;
@@ -43,6 +44,7 @@ public final class OracleJdbcBackend {
 
         this.connection = DriverManager.getConnection(jdbcUrl, user, password);
         this.connection.setAutoCommit(false);
+        this.bindOrder = new ArrayList<>();
         this.rows = new ArrayList<>();
         this.importRows = null;
     }
@@ -99,6 +101,7 @@ public final class OracleJdbcBackend {
             preparedStatement.close();
             preparedStatement = null;
         }
+        bindOrder = new ArrayList<>();
     }
 
     public boolean isStatementOpen() {
@@ -136,8 +139,11 @@ public final class OracleJdbcBackend {
     }
 
     public void prepareQuery(String sql) throws SQLException {
+        ParsedSql parsedSql = parseBindParameters(sql);
+
         closeStatement();
-        preparedStatement = connection.prepareStatement(sql);
+        bindOrder = parsedSql.bindOrder;
+        preparedStatement = connection.prepareStatement(parsedSql.sql);
     }
 
     public int executeQuery() throws SQLException {
@@ -181,32 +187,84 @@ public final class OracleJdbcBackend {
             throw new SQLException("invalid JDBC bind parameter arrays");
         }
 
+        if (!bindOrder.isEmpty()) {
+            for (int i = 0; i < bindOrder.size(); i++) {
+                int sourceIndex = findBindParameter(names, bindOrder.get(i));
+                if (sourceIndex < 0) {
+                    throw new SQLException("missing JDBC bind parameter " + bindOrder.get(i));
+                }
+                bindAtIndex(i + 1, types[sourceIndex], values[sourceIndex]);
+            }
+            return;
+        }
+
         for (int i = 0; i < names.length; i++) {
             int index = bindIndexOrFallback(names[i], i + 1);
-            if (values[i] == null) {
-                setNullAtNameOrIndex(names[i], index, jdbcType(types[i]));
-                continue;
-            }
+            bindAtNameOrIndex(names[i], index, types[i], values[i]);
+        }
+    }
 
-            switch (types[i]) {
-                case 1:
-                    bindAtNameOrIndex("setBigDecimalAtName", new Class<?>[] {String.class, BigDecimal.class},
-                            names[i], index, new BigDecimal(values[i].toString()));
-                    break;
-                case 2:
-                    bindAtNameOrIndex("setStringAtName", new Class<?>[] {String.class, String.class},
-                            names[i], index, longValueString((byte[]) values[i]));
-                    break;
-                case 3:
-                    bindAtNameOrIndex("setBytesAtName", new Class<?>[] {String.class, byte[].class},
-                            names[i], index, longValueBytes((byte[]) values[i]));
-                    break;
-                default:
-                    bindAtNameOrIndex("setStringAtName", new Class<?>[] {String.class, String.class},
-                            names[i], index, values[i].toString());
-                    break;
+    private void bindAtNameOrIndex(String name, int index, int type, Object value) throws SQLException {
+        if (type == 5) {
+            throw new SQLException("RETURNING output bind is not supported by JNI backend yet");
+        }
+        if (value == null) {
+            setNullAtNameOrIndex(name, index, jdbcType(type));
+            return;
+        }
+
+        switch (type) {
+            case 1:
+                bindAtNameOrIndex("setBigDecimalAtName", new Class<?>[] {String.class, BigDecimal.class},
+                        name, index, new BigDecimal(value.toString()));
+                break;
+            case 2:
+                bindAtNameOrIndex("setStringAtName", new Class<?>[] {String.class, String.class},
+                        name, index, longValueString((byte[]) value));
+                break;
+            case 3:
+                bindAtNameOrIndex("setBytesAtName", new Class<?>[] {String.class, byte[].class},
+                        name, index, longValueBytes((byte[]) value));
+                break;
+            default:
+                bindAtNameOrIndex("setStringAtName", new Class<?>[] {String.class, String.class},
+                        name, index, value.toString());
+                break;
+        }
+    }
+
+    private void bindAtIndex(int index, int type, Object value) throws SQLException {
+        if (type == 5) {
+            throw new SQLException("RETURNING output bind is not supported by JNI backend yet");
+        }
+        if (value == null) {
+            preparedStatement.setNull(index, jdbcType(type));
+            return;
+        }
+
+        switch (type) {
+            case 1:
+                preparedStatement.setBigDecimal(index, new BigDecimal(value.toString()));
+                break;
+            case 2:
+                preparedStatement.setString(index, longValueString((byte[]) value));
+                break;
+            case 3:
+                preparedStatement.setBytes(index, longValueBytes((byte[]) value));
+                break;
+            default:
+                preparedStatement.setString(index, value.toString());
+                break;
+        }
+    }
+
+    private static int findBindParameter(String[] names, String wanted) {
+        for (int i = 0; i < names.length; i++) {
+            if (wanted.equals(names[i])) {
+                return i;
             }
         }
+        return -1;
     }
 
     private static int bindIndexOrFallback(String name, int fallback) {
@@ -305,6 +363,79 @@ public final class OracleJdbcBackend {
         return new String(longValueBytes(raw), StandardCharsets.UTF_8);
     }
 
+    private static ParsedSql parseBindParameters(String sql) {
+        StringBuilder rewritten = new StringBuilder(sql.length());
+        List<String> order = new ArrayList<>();
+        boolean inString = false;
+
+        for (int i = 0; i < sql.length(); i++) {
+            char ch = sql.charAt(i);
+            if (ch == '\'') {
+                rewritten.append(ch);
+                if (inString && i + 1 < sql.length() && sql.charAt(i + 1) == '\'') {
+                    rewritten.append(sql.charAt(++i));
+                } else {
+                    inString = !inString;
+                }
+                continue;
+            }
+
+            if (!inString && ch == ':') {
+                int end = bindNameEnd(sql, i);
+                if (end > i) {
+                    order.add(sql.substring(i, end));
+                    rewritten.append('?');
+                    i = end - 1;
+                    continue;
+                }
+            }
+
+            rewritten.append(ch);
+        }
+
+        return new ParsedSql(rewritten.toString(), order);
+    }
+
+    private static int bindNameEnd(String sql, int start) {
+        if (sql.startsWith(":now", start)) {
+            int end = start + 4;
+            if (end == sql.length() || !isIdentifierPart(sql.charAt(end))) {
+                return end;
+            }
+            return start;
+        }
+
+        int pos = start + 1;
+        if (pos >= sql.length() || !isOracleFdwBindPrefix(sql.charAt(pos))) {
+            return start;
+        }
+        pos++;
+        int digitsStart = pos;
+        while (pos < sql.length() && Character.isDigit(sql.charAt(pos))) {
+            pos++;
+        }
+
+        return pos > digitsStart ? pos : start;
+    }
+
+    private static boolean isOracleFdwBindPrefix(char ch) {
+        return ch == 'p' || ch == 'k' || ch == 'r';
+    }
+
+    private static boolean isIdentifierPart(char ch) {
+        return Character.isLetterOrDigit(ch) || ch == '_' || ch == '$' || ch == '#';
+    }
+
+    private static final class ParsedSql {
+        final String sql;
+        final List<String> bindOrder;
+
+        ParsedSql(String sql, List<String> bindOrder) {
+            this.sql = sql;
+            this.bindOrder = bindOrder;
+        }
+    }
+
     public boolean fetchNext() {
         if (nextRow >= rows.size()) {
             currentRow = null;
@@ -341,6 +472,12 @@ public final class OracleJdbcBackend {
             connection.commit();
         } else {
             connection.rollback();
+        }
+    }
+
+    public void setSavepoint(int nestLevel) throws SQLException {
+        try (Statement stmt = connection.createStatement()) {
+            stmt.execute("SAVEPOINT s" + nestLevel);
         }
     }
 

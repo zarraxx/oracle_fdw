@@ -50,6 +50,8 @@ typedef struct JniSessionState
 	unsigned int next_row;
 	int import_open;
 	int callback_registered;
+	int xact_level;
+	int readonly;
 	JniLobContent *lobs;
 } JniSessionState;
 
@@ -70,6 +72,7 @@ static jmethodID fetch_next_mid = NULL;
 static jmethodID get_value_mid = NULL;
 static jmethodID execute_call_mid = NULL;
 static jmethodID end_transaction_mid = NULL;
+static jmethodID set_savepoint_mid = NULL;
 static jmethodID rollback_to_savepoint_mid = NULL;
 static jmethodID explain_mid = NULL;
 static jmethodID load_import_columns_mid = NULL;
@@ -370,6 +373,27 @@ checkJava(JNIEnv *env, const char *message)
 	}
 }
 
+static void
+clearJavaException(JNIEnv *env, const char *message)
+{
+	if ((*env)->ExceptionCheck(env))
+	{
+		jthrowable throwable = (*env)->ExceptionOccurred(env);
+		char *detail;
+
+		(*env)->ExceptionClear(env);
+		detail = jthrowableToDetail(env, throwable);
+		if (throwable)
+			(*env)->DeleteLocalRef(env, throwable);
+
+		jniDebug3(message);
+		jniDebug3(detail);
+#ifdef USE_JNI_BACKEND
+		free(detail);
+#endif
+	}
+}
+
 static jstring
 newJavaString(JNIEnv *env, const char *value)
 {
@@ -551,6 +575,7 @@ ensureJvm(void)
 		loadMethod(jni_env, &get_value_mid, "getValue", "(I)Ljava/lang/String;", 0);
 		loadMethod(jni_env, &execute_call_mid, "executeCall", "(Ljava/lang/String;)V", 0);
 		loadMethod(jni_env, &end_transaction_mid, "endTransaction", "(Z)V", 0);
+		loadMethod(jni_env, &set_savepoint_mid, "setSavepoint", "(I)V", 0);
 		loadMethod(jni_env, &rollback_to_savepoint_mid, "rollbackToSavepoint", "(I)V", 0);
 		loadMethod(jni_env, &explain_mid, "explain", "(Ljava/lang/String;)[Ljava/lang/String;", 0);
 		loadMethod(jni_env, &load_import_columns_mid, "loadImportColumns", "(Ljava/lang/String;Ljava/lang/String;III)V", 0);
@@ -619,6 +644,30 @@ freeLobs(JniSessionState *state)
 	}
 	if (state)
 		state->lobs = NULL;
+}
+
+static void
+closeStateStatement(JniSessionState *state, int noerror)
+{
+	JNIEnv *env;
+
+	if (!state || !state->backend)
+		return;
+
+	env = getEnv();
+	if (!env)
+		return;
+
+	(*env)->CallVoidMethod(env, state->backend, close_statement_mid);
+	if (noerror)
+		clearJavaException(env, "ignoring error closing JDBC backend statement");
+	else
+		checkJava(env, "error closing JDBC backend statement");
+
+	freeLobs(state);
+	state->current_table = NULL;
+	state->next_row = 0;
+	state->import_open = 0;
 }
 
 static void
@@ -758,6 +807,27 @@ copyValueToColumn(oracleSession *session, struct oraColumn *column, unsigned int
 	}
 }
 
+static void
+setSavepoints(JniSessionState *state, int nest_level)
+{
+	JNIEnv *env;
+
+	if (!state || !state->backend)
+		return;
+
+	env = ensureJvm();
+	while (state->xact_level < nest_level)
+	{
+		++state->xact_level;
+
+		if (state->readonly)
+			continue;
+
+		(*env)->CallVoidMethod(env, state->backend, set_savepoint_mid, (jint)state->xact_level);
+		checkJava(env, "error setting Oracle savepoint through JDBC backend");
+	}
+}
+
 oracleSession *
 oracleGetSession(const char *connectstring, oraIsoLevel isolation_level, char *user, char *password,
 				 const char *nls_lang, const char *timezone, int have_nchar,
@@ -773,11 +843,9 @@ oracleGetSession(const char *connectstring, oraIsoLevel isolation_level, char *u
 	jintArray version;
 	int version_values[5];
 
-	(void)isolation_level;
 	(void)nls_lang;
 	(void)timezone;
 	(void)tablename;
-	(void)curlevel;
 
 	local_backend = (*env)->NewObject(env, backend_class, ctor_mid, j_connect, j_user, j_password);
 	checkJava(env, "error connecting to Oracle through JDBC backend");
@@ -791,6 +859,8 @@ oracleGetSession(const char *connectstring, oraIsoLevel isolation_level, char *u
 
 	state->backend = (*env)->NewGlobalRef(env, local_backend);
 	checkJava(env, "error retaining JDBC backend connection");
+	state->xact_level = 1;
+	state->readonly = (isolation_level == ORA_TRANS_READ_ONLY);
 	session->thin_conn = state->backend;
 	session->thin_runtime = state;
 	session->have_nchar = have_nchar;
@@ -810,30 +880,20 @@ oracleGetSession(const char *connectstring, oraIsoLevel isolation_level, char *u
 	registerSession(state);
 	oracleRegisterCallback(state);
 	state->callback_registered = 1;
+	setSavepoints(state, curlevel);
 	return session;
 }
 
 void
 oracleCloseStatement(oracleSession *session)
 {
-	JNIEnv *env;
 	JniSessionState *state;
 
 	if (!session || !session->thin_runtime)
 		return;
 
-	env = ensureJvm();
 	state = getState(session);
-	if (state->backend)
-	{
-		(*env)->CallVoidMethod(env, state->backend, close_statement_mid);
-		checkJava(env, "error closing JDBC backend statement");
-	}
-
-	freeLobs(state);
-	state->current_table = NULL;
-	state->next_row = 0;
-	state->import_open = 0;
+	closeStateStatement(state, 0);
 	session->thin_stmt = NULL;
 	session->thin_result = NULL;
 	session->last_batch = 0;
@@ -865,21 +925,53 @@ oracleCancel(void)
 void
 oracleEndTransaction(void *arg, int is_commit, int silent)
 {
-	(void)arg;
-	(void)is_commit;
-	(void)silent;
+	JNIEnv *env;
+	JniSessionState *state = (JniSessionState *)arg;
 
-	jniTrace("oracleEndTransaction callback no-op for JNI backend");
+	if (!state || !state->backend)
+		return;
+
+	closeStateStatement(state, silent);
+
+	if (state->xact_level == 0)
+		return;
+	state->xact_level = 0;
+
+	env = getEnv();
+	if (!env)
+		return;
+
+	(*env)->CallVoidMethod(env, state->backend, end_transaction_mid, is_commit ? JNI_TRUE : JNI_FALSE);
+	if (silent)
+		clearJavaException(env, "ignoring error ending JDBC backend transaction");
+	else
+		checkJava(env, is_commit
+			? "error committing Oracle transaction through JDBC backend"
+			: "error rolling back Oracle transaction through JDBC backend");
 }
 
 void
 oracleEndSubtransaction(void *arg, int nest_level, int is_commit)
 {
-	(void)arg;
-	(void)nest_level;
-	(void)is_commit;
+	JNIEnv *env;
+	JniSessionState *state = (JniSessionState *)arg;
 
-	jniTrace("oracleEndSubtransaction callback no-op for JNI backend");
+	if (!state || !state->backend || nest_level <= 1)
+		return;
+
+	if (state->xact_level < nest_level)
+		return;
+
+	state->xact_level = nest_level - 1;
+
+	if (state->readonly || is_commit)
+		return;
+
+	closeStateStatement(state, 0);
+
+	env = ensureJvm();
+	(*env)->CallVoidMethod(env, state->backend, rollback_to_savepoint_mid, (jint)nest_level);
+	checkJava(env, "error rolling back Oracle subtransaction through JDBC backend");
 }
 
 int
