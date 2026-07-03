@@ -10,6 +10,8 @@ if(DEFINED ENV{CLANG_HOME} AND NOT CMAKE_C_COMPILER)
   file(TO_CMAKE_PATH "$ENV{CLANG_HOME}" CLANG_HOME)
   if(CMAKE_HOST_WIN32 AND CMAKE_GENERATOR MATCHES "Visual Studio" AND EXISTS "${CLANG_HOME}/bin/clang-cl.exe")
     set(CMAKE_C_COMPILER "${CLANG_HOME}/bin/clang-cl.exe" CACHE FILEPATH "C compiler" FORCE)
+  elseif(EXISTS "${CLANG_HOME}/bin/clang")
+    set(CMAKE_C_COMPILER "${CLANG_HOME}/bin/clang" CACHE FILEPATH "C compiler" FORCE)
   elseif(EXISTS "${CLANG_HOME}/bin/clang.exe")
     set(CMAKE_C_COMPILER "${CLANG_HOME}/bin/clang.exe" CACHE FILEPATH "C compiler" FORCE)
   elseif(CMAKE_HOST_WIN32 AND EXISTS "${CLANG_HOME}/bin/clang-cl.exe")
@@ -86,6 +88,7 @@ pg_config_value("--includedir-server" PG_INCLUDEDIR_SERVER)
 pg_config_value("--includedir" PG_INCLUDEDIR)
 pg_config_value("--pkglibdir" PG_PKGLIBDIR)
 pg_config_value("--sharedir" PG_SHAREDIR)
+pg_config_value("--cppflags" PG_CPPFLAGS)
 pg_config_value("--cflags" PG_CFLAGS)
 pg_config_value("--ldflags" PG_LDFLAGS)
 
@@ -96,22 +99,64 @@ function(split_flags flags output_variable)
   endif()
 endfunction()
 
+function(filter_pg_compile_flags input_list_variable output_variable)
+  set(filtered_flags)
+  set(skip_next FALSE)
+  foreach(flag IN LISTS ${input_list_variable})
+    if(skip_next)
+      set(skip_next FALSE)
+    elseif(flag STREQUAL "-I" OR flag STREQUAL "-isystem")
+      set(skip_next TRUE)
+    elseif(flag MATCHES "^-I.+" OR flag MATCHES "^-isystem.+" OR flag MATCHES "^--sysroot=.*" OR flag MATCHES "^--target=.*")
+      continue()
+    else()
+      list(APPEND filtered_flags "${flag}")
+    endif()
+  endforeach()
+  set(${output_variable} "${filtered_flags}" PARENT_SCOPE)
+endfunction()
+
+function(filter_pg_link_flags input_list_variable output_variable)
+  set(filtered_flags)
+  set(skip_next FALSE)
+  foreach(flag IN LISTS ${input_list_variable})
+    if(skip_next)
+      set(skip_next FALSE)
+    elseif(flag STREQUAL "-L")
+      set(skip_next TRUE)
+    elseif(flag MATCHES "^-L.+" OR flag MATCHES "^--sysroot=.*" OR flag MATCHES "^--target=.*" OR flag MATCHES "^-Wl,-rpath-link,")
+      continue()
+    else()
+      list(APPEND filtered_flags "${flag}")
+    endif()
+  endforeach()
+  set(${output_variable} "${filtered_flags}" PARENT_SCOPE)
+endfunction()
+
+split_flags("${PG_CPPFLAGS}" PG_CPPFLAGS_LIST)
 split_flags("${PG_CFLAGS}" PG_CFLAGS_LIST)
 split_flags("${PG_LDFLAGS}" PG_LDFLAGS_LIST)
+set(PG_COMPILE_FLAGS_LIST ${PG_CPPFLAGS_LIST} ${PG_CFLAGS_LIST})
+filter_pg_compile_flags(PG_COMPILE_FLAGS_LIST PG_FILTERED_COMPILE_FLAGS_LIST)
+filter_pg_link_flags(PG_LDFLAGS_LIST PG_FILTERED_LDFLAGS_LIST)
 
 set(POSTGRESQL_INCLUDE_DIRS
-  "${POSTGRESQL_HOME}/include/postgresql/server/port/win32_msvc"
-  "${POSTGRESQL_HOME}/include/postgresql/server/port/win32"
-  "${POSTGRESQL_HOME}/include/postgresql/server/port"
-  "${POSTGRESQL_HOME}/include/postgresql/server"
-  "${POSTGRESQL_HOME}/include/postgresql/internal"
-  "${POSTGRESQL_HOME}/include/server/port/win32_msvc"
-  "${POSTGRESQL_HOME}/include/server/port/win32"
   "${POSTGRESQL_HOME}/include/server/port"
   "${POSTGRESQL_HOME}/include/server"
   "${POSTGRESQL_HOME}/include/internal"
   "${POSTGRESQL_HOME}/include"
 )
+
+if(WIN32)
+  list(PREPEND POSTGRESQL_INCLUDE_DIRS
+    "${POSTGRESQL_HOME}/include/postgresql/server/port/win32_msvc"
+    "${POSTGRESQL_HOME}/include/postgresql/server/port/win32"
+    "${POSTGRESQL_HOME}/include/postgresql/server"
+    "${POSTGRESQL_HOME}/include/postgresql/internal"
+    "${POSTGRESQL_HOME}/include/server/port/win32_msvc"
+    "${POSTGRESQL_HOME}/include/server/port/win32"
+  )
+endif()
 
 if(PG_INCLUDEDIR_SERVER)
   list(PREPEND POSTGRESQL_INCLUDE_DIRS "${PG_INCLUDEDIR_SERVER}")
@@ -196,7 +241,7 @@ target_include_directories(oracle_fdw PRIVATE
   ${ORACLE_INCLUDE_DIRS}
 )
 
-target_compile_options(oracle_fdw PRIVATE ${PG_CFLAGS_LIST})
+target_compile_options(oracle_fdw PRIVATE ${PG_FILTERED_COMPILE_FLAGS_LIST})
 
 target_link_libraries(oracle_fdw PRIVATE ${ORACLE_LIBRARY})
 
@@ -204,7 +249,7 @@ if(POSTGRESQL_LIBRARY)
   target_link_libraries(oracle_fdw PRIVATE ${POSTGRESQL_LIBRARY})
 endif()
 
-target_link_options(oracle_fdw PRIVATE ${PG_LDFLAGS_LIST})
+target_link_options(oracle_fdw PRIVATE ${PG_FILTERED_LDFLAGS_LIST})
 
 if(MSVC)
   target_compile_definitions(oracle_fdw PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -217,22 +262,41 @@ if(ORACLE_FDW_BUILD_JNI_FDW OR ORACLE_FDW_BUILD_UTILS_DEMO)
   if(NOT DEFINED ENV{JDK17_HOME} OR "$ENV{JDK17_HOME}" STREQUAL "")
     message(FATAL_ERROR "Environment variable JDK17_HOME must be set when ORACLE_FDW_BUILD_JNI_FDW or ORACLE_FDW_BUILD_UTILS_DEMO is ON.")
   endif()
-  file(TO_CMAKE_PATH "$ENV{JDK17_HOME}" JDK17_HOME)
+  file(TO_CMAKE_PATH "$ENV{JDK17_HOME}" JDK17_HOME_INPUT)
+  set(JDK17_HOME_CANDIDATES
+    "${JDK17_HOME_INPUT}"
+    "${JDK17_HOME_INPUT}/jdk"
+  )
+  set(JDK17_ROOT)
+  foreach(candidate IN LISTS JDK17_HOME_CANDIDATES)
+    if(EXISTS "${candidate}/include/jni.h")
+      set(JDK17_ROOT "${candidate}")
+      break()
+    endif()
+  endforeach()
+  if(NOT JDK17_ROOT)
+    message(FATAL_ERROR "JDK17_HOME='${JDK17_HOME_INPUT}' must point to a JDK root, or a wrapper directory containing a 'jdk/' subdirectory with headers.")
+  endif()
+  set(JDK17_BIN_PATHS
+    "${JDK17_HOME_INPUT}/bin"
+    "${JDK17_ROOT}/bin"
+  )
+  list(REMOVE_DUPLICATES JDK17_BIN_PATHS)
   find_program(JAVA_EXECUTABLE
     NAMES java java.exe
-    PATHS "${JDK17_HOME}/bin"
+    PATHS ${JDK17_BIN_PATHS}
     NO_DEFAULT_PATH
     REQUIRED
   )
   find_program(JAVAC_EXECUTABLE
     NAMES javac javac.exe
-    PATHS "${JDK17_HOME}/bin"
+    PATHS ${JDK17_BIN_PATHS}
     NO_DEFAULT_PATH
     REQUIRED
   )
   find_program(JAR_EXECUTABLE
     NAMES jar jar.exe
-    PATHS "${JDK17_HOME}/bin"
+    PATHS ${JDK17_BIN_PATHS}
     NO_DEFAULT_PATH
     REQUIRED
   )
@@ -249,19 +313,19 @@ if(ORACLE_FDW_BUILD_JNI_FDW OR ORACLE_FDW_BUILD_UTILS_DEMO)
   endif()
 
   set(JDK17_INCLUDE_DIRS
-    "${JDK17_HOME}/include"
+    "${JDK17_ROOT}/include"
   )
   if(WIN32)
-    list(APPEND JDK17_INCLUDE_DIRS "${JDK17_HOME}/include/win32")
+    list(APPEND JDK17_INCLUDE_DIRS "${JDK17_ROOT}/include/win32")
   elseif(APPLE)
-    list(APPEND JDK17_INCLUDE_DIRS "${JDK17_HOME}/include/darwin")
+    list(APPEND JDK17_INCLUDE_DIRS "${JDK17_ROOT}/include/darwin")
   else()
-    list(APPEND JDK17_INCLUDE_DIRS "${JDK17_HOME}/include/linux")
+    list(APPEND JDK17_INCLUDE_DIRS "${JDK17_ROOT}/include/linux")
   endif()
 
   find_library(JVM_LIBRARY
     NAMES jvm
-    PATHS "${JDK17_HOME}/lib" "${JDK17_HOME}/lib/server" "${JDK17_HOME}/jre/lib/server"
+    PATHS "${JDK17_ROOT}/lib" "${JDK17_ROOT}/lib/server" "${JDK17_ROOT}/jre/lib/server"
     NO_DEFAULT_PATH
     REQUIRED
   )
@@ -276,7 +340,7 @@ if(ORACLE_FDW_BUILD_JNI_FDW OR ORACLE_FDW_BUILD_UTILS_DEMO)
   add_custom_command(
     OUTPUT "${ORACLE_FDW_JNI_BRIDGE_JAR}"
     COMMAND "${CMAKE_COMMAND}" -E make_directory "${ORACLE_FDW_JNI_CLASSES_DIR}"
-    COMMAND "${JAVAC_EXECUTABLE}" -encoding UTF-8 -source 17 -target 17
+    COMMAND "${JAVAC_EXECUTABLE}" -encoding UTF-8 --release 17
             -d "${ORACLE_FDW_JNI_CLASSES_DIR}"
             "${CMAKE_CURRENT_SOURCE_DIR}/jni_backend/java/OracleJdbcBackend.java"
     COMMAND "${JAR_EXECUTABLE}" cf "${ORACLE_FDW_JNI_BRIDGE_JAR}" -C "${ORACLE_FDW_JNI_CLASSES_DIR}" .
@@ -310,12 +374,12 @@ if(ORACLE_FDW_BUILD_JNI_FDW)
     ${POSTGRESQL_INCLUDE_DIRS}
     ${JDK17_INCLUDE_DIRS}
   )
-  target_compile_options(oracle_jni_fdw PRIVATE ${PG_CFLAGS_LIST})
+  target_compile_options(oracle_jni_fdw PRIVATE ${PG_FILTERED_COMPILE_FLAGS_LIST})
   target_link_libraries(oracle_jni_fdw PRIVATE ${JVM_LIBRARY})
   if(POSTGRESQL_LIBRARY)
     target_link_libraries(oracle_jni_fdw PRIVATE ${POSTGRESQL_LIBRARY})
   endif()
-  target_link_options(oracle_jni_fdw PRIVATE ${PG_LDFLAGS_LIST})
+  target_link_options(oracle_jni_fdw PRIVATE ${PG_FILTERED_LDFLAGS_LIST})
 
   if(MSVC)
     target_compile_definitions(oracle_jni_fdw PRIVATE _CRT_SECURE_NO_WARNINGS)
@@ -384,7 +448,7 @@ if(ORACLE_FDW_BUILD_UTILS_DEMO)
     "${CMAKE_CURRENT_SOURCE_DIR}"
     ${POSTGRESQL_INCLUDE_DIRS}
   )
-  target_compile_options(oracle_utils_demo_support PRIVATE ${PG_CFLAGS_LIST})
+  target_compile_options(oracle_utils_demo_support PRIVATE ${PG_FILTERED_COMPILE_FLAGS_LIST})
 
   add_executable(oracle_utils_demo_oci
     test/oracle_utils_demo.c
@@ -397,12 +461,12 @@ if(ORACLE_FDW_BUILD_UTILS_DEMO)
     ${POSTGRESQL_INCLUDE_DIRS}
     ${ORACLE_INCLUDE_DIRS}
   )
-  target_compile_options(oracle_utils_demo_oci PRIVATE ${PG_CFLAGS_LIST})
+  target_compile_options(oracle_utils_demo_oci PRIVATE ${PG_FILTERED_COMPILE_FLAGS_LIST})
   target_link_libraries(oracle_utils_demo_oci PRIVATE oracle_utils_demo_support ${ORACLE_LIBRARY})
   if(POSTGRESQL_LIBRARY)
     target_link_libraries(oracle_utils_demo_oci PRIVATE ${POSTGRESQL_LIBRARY})
   endif()
-  target_link_options(oracle_utils_demo_oci PRIVATE ${PG_LDFLAGS_LIST})
+  target_link_options(oracle_utils_demo_oci PRIVATE ${PG_FILTERED_LDFLAGS_LIST})
 
   add_executable(oracle_utils_demo_rust
     test/oracle_utils_demo.c
@@ -415,9 +479,9 @@ if(ORACLE_FDW_BUILD_UTILS_DEMO)
     "${CMAKE_CURRENT_SOURCE_DIR}"
     ${POSTGRESQL_INCLUDE_DIRS}
   )
-  target_compile_options(oracle_utils_demo_rust PRIVATE ${PG_CFLAGS_LIST})
+  target_compile_options(oracle_utils_demo_rust PRIVATE ${PG_FILTERED_COMPILE_FLAGS_LIST})
   target_link_libraries(oracle_utils_demo_rust PRIVATE oracle_utils_demo_support oracle_rs_backend)
-  target_link_options(oracle_utils_demo_rust PRIVATE ${PG_LDFLAGS_LIST})
+  target_link_options(oracle_utils_demo_rust PRIVATE ${PG_FILTERED_LDFLAGS_LIST})
 
   add_executable(oracle_utils_demo_jni
     test/oracle_utils_demo.c
@@ -435,9 +499,9 @@ if(ORACLE_FDW_BUILD_UTILS_DEMO)
     ${POSTGRESQL_INCLUDE_DIRS}
     ${JDK17_INCLUDE_DIRS}
   )
-  target_compile_options(oracle_utils_demo_jni PRIVATE ${PG_CFLAGS_LIST})
+  target_compile_options(oracle_utils_demo_jni PRIVATE ${PG_FILTERED_COMPILE_FLAGS_LIST})
   target_link_libraries(oracle_utils_demo_jni PRIVATE oracle_utils_demo_support ${JVM_LIBRARY})
-  target_link_options(oracle_utils_demo_jni PRIVATE ${PG_LDFLAGS_LIST})
+  target_link_options(oracle_utils_demo_jni PRIVATE ${PG_FILTERED_LDFLAGS_LIST})
 
   if(WIN32)
     target_link_libraries(oracle_utils_demo_rust PRIVATE
